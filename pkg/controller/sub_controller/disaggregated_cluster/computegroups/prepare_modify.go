@@ -153,12 +153,21 @@ func (dcgs *DisaggregatedComputeGroupsController) decommissionBENodes(
 	if len(dropNodes) == 0 {
 		return nil
 	}
+	klog.Infof("decommissionBENodes cgName %s prepare to decommission BE nodes: %s", cgName, formatBENodesForLog(dropNodes))
 	err = masterDBClient.DecommissionBE(dropNodes)
 	if err != nil {
 		klog.Errorf("decommissionBENodes cgName %s DropBENodes failed, err:%s ", cgName, err.Error())
 		return err
 	}
 	return nil
+}
+
+func formatBENodesForLog(nodes []*mysql.Backend) string {
+	hosts := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		hosts = append(hosts, node.Host+":"+strconv.Itoa(node.HeartbeatPort))
+	}
+	return strings.Join(hosts, ",")
 }
 
 func (dcgs *DisaggregatedComputeGroupsController) getMasterSqlClient(ctx context.Context, cluster *dv1.DorisDisaggregatedCluster) (*mysql.DB, error) {

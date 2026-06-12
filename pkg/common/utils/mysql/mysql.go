@@ -177,7 +177,18 @@ func (db *DB) DecommissionBE(nodes []*Backend) error {
 	}
 
 	alter := fmt.Sprintf("ALTER SYSTEM DECOMMISSION BACKEND %s;", nodesString)
-	_, err := db.Exec(alter)
+	klog.Infof("mysql DecommissionBE prepare to execute sql: %s", alter)
+	result, err := db.Exec(alter)
+	if err != nil {
+		klog.Errorf("mysql DecommissionBE execute sql failed, sql: %s, err: %s", alter, err.Error())
+		return err
+	}
+	rowsAffected, rowsErr := result.RowsAffected()
+	if rowsErr != nil {
+		klog.Infof("mysql DecommissionBE execute sql succeeded, sql: %s, rowsAffected: unknown, rowsAffectedErr: %s", alter, rowsErr.Error())
+		return nil
+	}
+	klog.Infof("mysql DecommissionBE execute sql succeeded, sql: %s, rowsAffected: %d", alter, rowsAffected)
 	return err
 }
 

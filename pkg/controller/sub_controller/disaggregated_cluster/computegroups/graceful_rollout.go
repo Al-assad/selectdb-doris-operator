@@ -20,6 +20,7 @@ package computegroups
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -78,6 +79,8 @@ const (
 
 var execInPod = k8s.ExecInPod
 
+var errBackendNotFound = errors.New("backend not found")
+
 // gracefulRolloutReconcile is the entry point for graceful two-phase restart/shutdown.
 // It returns true if the caller should skip normal StatefulSet apply (because graceful action is in progress).
 func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
@@ -100,6 +103,24 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 	if action == nil && storedAction == nil {
 		// No graceful action needed or in progress.
 		return false, nil
+	}
+
+	if storedAction != nil && storedAction.Type == dv1.GracefulActionScaleDown {
+		requestedReplicas := *st.Spec.Replicas
+		currentReplicas := *est.Spec.Replicas
+		if storedAction.DesiredReplicas == nil || *storedAction.DesiredReplicas != requestedReplicas {
+			klog.Infof("gracefulRolloutReconcile: updating scale-down target for cg=%s to %d", cg.UniqueId, requestedReplicas)
+			storedAction.DesiredReplicas = &requestedReplicas
+		}
+		if requestedReplicas >= currentReplicas && !gracefulScaleDownPodStarted(storedAction) {
+			klog.Infof("gracefulRolloutReconcile: cancelling scale-down for cg=%s because requested replicas=%d current replicas=%d",
+				cg.UniqueId, requestedReplicas, currentReplicas)
+			cgStatus.Phase = dv1.Reconciling
+			if err := dcgs.finalizeGracefulAction(ctx, st); err != nil {
+				return true, err
+			}
+			return false, nil
+		}
 	}
 
 	// If we have a new action and no existing action, store the action first.
@@ -162,6 +183,8 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 		ga.LastMessage = err.Error()
 		klog.Errorf("gracefulRolloutReconcile: state machine error for cg=%s pod=%s phase=%s: %v",
 			cg.UniqueId, ga.CurrentPod, ga.Phase, err)
+		prepareGracefulStatefulSet(st, est, ga)
+		setGracefulAction(st, ga)
 		return true, err
 	}
 
@@ -333,6 +356,11 @@ func (dcgs *DisaggregatedComputeGroupsController) handleTriggerDrain(
 		if epoch, ok := backendProcessEpoch(backend); ok {
 			ga.InitialBackendEpoch = epoch
 		}
+	} else if ga.Type == dv1.GracefulActionScaleDown && errors.Is(backendErr, errBackendNotFound) {
+		klog.Infof("handleTriggerDrain: backend for scale-down pod %s is already absent, skipping drain", ga.CurrentPod)
+		ga.LastMessage = fmt.Sprintf("Backend for pod %s is already absent", ga.CurrentPod)
+		ga.Phase = dv1.GracefulPhaseDeletePod
+		return nil
 	} else {
 		klog.Warningf("handleTriggerDrain: failed to capture initial backend generation for pod %s uid=%s containerID=%s: %v",
 			ga.CurrentPod, ga.InitialPodUID, ga.InitialContainerID, backendErr)
@@ -462,12 +490,17 @@ func (dcgs *DisaggregatedComputeGroupsController) handleDeletePod(
 	est *appv1.StatefulSet,
 	ga *dv1.GracefulAction,
 ) error {
+	if ga.Type == dv1.GracefulActionScaleDown {
+		if err := dcgs.dropBackendByPodName(ctx, cluster, cgStatus, ga.CurrentPod); err != nil {
+			return fmt.Errorf("failed to drop backend for scale-down pod %s: %w", ga.CurrentPod, err)
+		}
+	}
+
 	pod, err := dcgs.getPod(ctx, cluster.Namespace, ga.CurrentPod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			klog.Infof("handleDeletePod: pod %s already deleted", ga.CurrentPod)
-			dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
-			return nil
+			return dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
 		}
 		return err
 	}
@@ -478,8 +511,7 @@ func (dcgs *DisaggregatedComputeGroupsController) handleDeletePod(
 	if err := dcgs.K8sclient.Delete(ctx, pod); err != nil {
 		if apierrors.IsNotFound(err) {
 			klog.Infof("handleDeletePod: pod %s uid=%s already deleted before delete call completed", ga.CurrentPod, string(pod.UID))
-			dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
-			return nil
+			return dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
 		}
 		return fmt.Errorf("failed to delete pod %s: %w", ga.CurrentPod, err)
 	}
@@ -487,8 +519,7 @@ func (dcgs *DisaggregatedComputeGroupsController) handleDeletePod(
 
 	dcgs.K8srecorder.Eventf(cluster, string(sc.EventNormal), string(sc.GracefulPodDeleted),
 		"Deleted pod %s during graceful %s", ga.CurrentPod, ga.Type)
-	dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
-	return nil
+	return dcgs.afterPodDeleted(ga, cluster, cg, cgStatus, est)
 }
 
 // afterPodDeleted determines the next phase after a pod is deleted.
@@ -498,7 +529,7 @@ func (dcgs *DisaggregatedComputeGroupsController) afterPodDeleted(
 	cg *dv1.ComputeGroup,
 	cgStatus *dv1.ComputeGroupStatus,
 	est *appv1.StatefulSet,
-) {
+) error {
 	switch ga.Type {
 	case dv1.GracefulActionRollingUpdate:
 		// Wait for replacement pod to become ready.
@@ -508,32 +539,37 @@ func (dcgs *DisaggregatedComputeGroupsController) afterPodDeleted(
 		// For scale down, update StatefulSet replicas after pod is deleted.
 		// This prevents StatefulSet from recreating the deleted pod.
 		newReplicas := ga.CurrentOrdinal // replicas = current ordinal (0-indexed)
-		dcgs.updateStatefulSetReplicas(context.Background(), est, newReplicas)
+		if err := dcgs.updateStatefulSetReplicas(context.Background(), est, newReplicas); err != nil {
+			return err
+		}
 		dcgs.advanceToNextPod(ga)
 	case dv1.GracefulActionDelete:
 		newReplicas := ga.CurrentOrdinal
-		dcgs.updateStatefulSetReplicas(context.Background(), est, newReplicas)
+		if err := dcgs.updateStatefulSetReplicas(context.Background(), est, newReplicas); err != nil {
+			return err
+		}
 		dcgs.advanceToNextPod(ga)
 	}
+	return nil
 }
 
 // updateStatefulSetReplicas patches the StatefulSet replicas to the given value.
-func (dcgs *DisaggregatedComputeGroupsController) updateStatefulSetReplicas(ctx context.Context, est *appv1.StatefulSet, replicas int32) {
+func (dcgs *DisaggregatedComputeGroupsController) updateStatefulSetReplicas(ctx context.Context, est *appv1.StatefulSet, replicas int32) error {
 	var current appv1.StatefulSet
 	if err := dcgs.K8sclient.Get(ctx, types.NamespacedName{Namespace: est.Namespace, Name: est.Name}, &current); err != nil {
-		klog.Errorf("updateStatefulSetReplicas: failed to get StatefulSet %s/%s: %v", est.Namespace, est.Name, err)
-		return
+		return fmt.Errorf("failed to get StatefulSet %s/%s: %w", est.Namespace, est.Name, err)
 	}
 	if *current.Spec.Replicas == replicas {
-		return
+		est.Spec.Replicas = &replicas
+		return nil
 	}
 	current.Spec.Replicas = &replicas
 	if err := dcgs.K8sclient.Update(ctx, &current); err != nil {
-		klog.Errorf("updateStatefulSetReplicas: failed to update StatefulSet %s/%s replicas to %d: %v",
-			est.Namespace, est.Name, replicas, err)
-	} else {
-		klog.Infof("updateStatefulSetReplicas: updated StatefulSet %s/%s replicas to %d", est.Namespace, est.Name, replicas)
+		return fmt.Errorf("failed to update StatefulSet %s/%s replicas to %d: %w", est.Namespace, est.Name, replicas, err)
 	}
+	est.Spec.Replicas = &replicas
+	klog.Infof("updateStatefulSetReplicas: updated StatefulSet %s/%s replicas to %d", est.Namespace, est.Name, replicas)
+	return nil
 }
 
 // handleWaitPodReady waits for the replacement pod (same ordinal) to become Ready.
@@ -784,7 +820,39 @@ func (dcgs *DisaggregatedComputeGroupsController) getBackendByPodName(
 			return backend, nil
 		}
 	}
-	return nil, fmt.Errorf("backend for pod %s not found", podName)
+	return nil, fmt.Errorf("%w for pod %s", errBackendNotFound, podName)
+}
+
+func (dcgs *DisaggregatedComputeGroupsController) dropBackendByPodName(
+	ctx context.Context,
+	cluster *dv1.DorisDisaggregatedCluster,
+	cgStatus *dv1.ComputeGroupStatus,
+	podName string,
+) error {
+	sqlClient, err := dcgs.getMasterSqlClient(ctx, cluster)
+	if err != nil {
+		return err
+	}
+	defer sqlClient.Close()
+
+	backends, err := sqlClient.GetBackendsByComputeGroupId(cgStatus.ComputeGroupId)
+	if err != nil {
+		return err
+	}
+	for _, backend := range backends {
+		if backendMatchesPod(backend, podName) {
+			return sqlClient.DropBE([]*mysql.Backend{backend})
+		}
+	}
+	klog.Infof("dropBackendByPodName: backend for pod %s is already absent", podName)
+	return nil
+}
+
+func gracefulScaleDownPodStarted(ga *dv1.GracefulAction) bool {
+	if ga == nil || ga.Type != dv1.GracefulActionScaleDown {
+		return false
+	}
+	return ga.CurrentPod != "" || ga.DrainTriggered || ga.Phase != dv1.GracefulPhaseTriggerDrain
 }
 
 func backendIsShutdown(backend *mysql.Backend) (bool, error) {

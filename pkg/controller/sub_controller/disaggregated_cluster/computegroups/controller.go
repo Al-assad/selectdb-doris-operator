@@ -251,41 +251,28 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileStatefulset(ctx conte
 		return &sc.Event{Type: sc.EventWarning, Reason: sc.CGStorageTemplateImmutable, Message: msg}, errors.New(msg)
 	}
 
-	err := dcgs.preApplyStatefulSet(ctx, st, &est, cluster, cg)
-	if err != nil {
-		klog.Errorf("disaggregatedComputeGroupsController reconcileStatefulset preApplyStatefulSet namespace=%s name=%s failed, err=%s", st.Namespace, st.Name, err.Error())
-		return &sc.Event{Type: sc.EventWarning, Reason: sc.CGSqlExecFailed, Message: err.Error()}, err
+	// Direct-drop scale-down is owned by the graceful state machine when the image
+	// supports it. Decommissioning keeps the legacy pre-apply ordering.
+	gracefulInProgress := false
+	if !cluster.Spec.EnableDecommission {
+		gracefulInProgress = dcgs.reconcileGracefulStatefulSet(ctx, st, &est, cluster, cg)
 	}
 
-	// be decimmission processing, skip apply statefulset.
-	if skipApplyStatefulset(cluster, cg) {
-		return nil, nil
+	if !gracefulInProgress {
+		err := dcgs.preApplyStatefulSet(ctx, st, &est, cluster, cg)
+		if err != nil {
+			klog.Errorf("disaggregatedComputeGroupsController reconcileStatefulset preApplyStatefulSet namespace=%s name=%s failed, err=%s", st.Namespace, st.Name, err.Error())
+			return &sc.Event{Type: sc.EventWarning, Reason: sc.CGSqlExecFailed, Message: err.Error()}, err
+		}
+
+		// be decommission processing, skip apply statefulset.
+		if skipApplyStatefulset(cluster, cg) {
+			return nil, nil
+		}
 	}
 
-	// Graceful two-phase restart/shutdown: check if we need to perform a graceful action.
-	// This must happen after preApply but before the actual StatefulSet apply.
-	if dcgs.RestConfig != nil {
-		var cgStatus *dv1.ComputeGroupStatus
-		for i := range cluster.Status.ComputeGroupStatuses {
-			if cluster.Status.ComputeGroupStatuses[i].UniqueId == cg.UniqueId {
-				cgStatus = &cluster.Status.ComputeGroupStatuses[i]
-				break
-			}
-		}
-		if cgStatus != nil {
-			// If a graceful action is already in progress or needs to start,
-			// ensure OnDelete strategy to prevent K8s from auto-deleting pods.
-			skipApply, gracefulErr := dcgs.gracefulRolloutReconcile(ctx, dcgs.RestConfig, st, &est, cluster, cg, cgStatus)
-			if gracefulErr != nil {
-				klog.Errorf("reconcileStatefulset gracefulRolloutReconcile failed: %v", gracefulErr)
-				// Continue with normal reconcile on error, don't block.
-			}
-			if skipApply {
-				// Graceful action is in progress. Apply StatefulSet with OnDelete strategy
-				// so K8s won't auto-delete pods, but still update the template.
-				ensureOnDeleteStrategy(st)
-			}
-		}
+	if cluster.Spec.EnableDecommission {
+		dcgs.reconcileGracefulStatefulSet(ctx, st, &est, cluster, cg)
 	}
 
 	if st.Spec.UpdateStrategy.Type == appv1.OnDeleteStatefulSetStrategyType {
@@ -316,6 +303,38 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileStatefulset(ctx conte
 		return &sc.Event{Type: sc.EventWarning, Reason: sc.CGApplyResourceFailed, Message: err.Error()}, err
 	}
 	return nil, nil
+}
+
+func (dcgs *DisaggregatedComputeGroupsController) reconcileGracefulStatefulSet(
+	ctx context.Context,
+	st, est *appv1.StatefulSet,
+	cluster *dv1.DorisDisaggregatedCluster,
+	cg *dv1.ComputeGroup,
+) bool {
+	if dcgs.RestConfig == nil {
+		return false
+	}
+	var cgStatus *dv1.ComputeGroupStatus
+	for i := range cluster.Status.ComputeGroupStatuses {
+		if cluster.Status.ComputeGroupStatuses[i].UniqueId == cg.UniqueId {
+			cgStatus = &cluster.Status.ComputeGroupStatuses[i]
+			break
+		}
+	}
+	if cgStatus == nil {
+		return false
+	}
+
+	skipApply, err := dcgs.gracefulRolloutReconcile(ctx, dcgs.RestConfig, st, est, cluster, cg, cgStatus)
+	if err != nil {
+		klog.Errorf("reconcileStatefulset gracefulRolloutReconcile failed: %v", err)
+	}
+	if skipApply {
+		// Do not fall through to the legacy DropBE workflow while the graceful
+		// state machine owns this StatefulSet.
+		ensureOnDeleteStrategy(st)
+	}
+	return skipApply
 }
 
 func volumeClaimTemplatesEqual(new, old []corev1.PersistentVolumeClaim) bool {

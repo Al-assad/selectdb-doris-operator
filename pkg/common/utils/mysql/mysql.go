@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
@@ -186,14 +187,31 @@ func (db *DB) DropBE(nodes []*Backend) error {
 		klog.Infoln("mysql DropBE BE node is empty")
 		return nil
 	}
-	nodesString := fmt.Sprintf(`"%s:%d"`, nodes[0].Host, nodes[0].HeartbeatPort)
-	for _, node := range nodes[1:] {
-		nodesString = nodesString + fmt.Sprintf(`,"%s:%d"`, node.Host, node.HeartbeatPort)
-	}
 
-	alter := fmt.Sprintf("ALTER SYSTEM DROPP BACKEND %s;", nodesString)
-	_, err := db.Exec(alter)
-	return err
+	for _, node := range nodes {
+		alter := fmt.Sprintf(`ALTER SYSTEM DROPP BACKEND "%s:%d";`, node.Host, node.HeartbeatPort)
+		if _, err := db.Exec(alter); err != nil {
+			if isBackendAlreadyAbsentError(err) {
+				klog.Infof("mysql DropBE backend %s:%d is already absent", node.Host, node.HeartbeatPort)
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func isBackendAlreadyAbsentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "cluster_not_found") {
+		return false
+	}
+	return strings.Contains(message, "can not find to drop nodes") ||
+		strings.Contains(message, "cannot find to drop nodes") ||
+		strings.Contains(message, "does not exist")
 }
 
 func (db *DB) DropObserver(nodes []*Frontend) error {

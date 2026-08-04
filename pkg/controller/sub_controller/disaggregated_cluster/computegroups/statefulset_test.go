@@ -336,6 +336,72 @@ func TestGracefulRolloutReconcile_EnablesGracefulActionWhenSentinelSupported(t *
 	}
 }
 
+func TestGracefulRolloutReconcileCancelsUntouchedScaleDownAfterScaleUp(t *testing.T) {
+	dcgs, cluster, cg, cgStatus, desired, existing := newGracefulScaleDownTestObjects(t)
+	requestedReplicas := int32(2)
+	desired.Spec.Replicas = &requestedReplicas
+	storedDesiredReplicas := int32(1)
+	setGracefulAction(existing, &dv1.GracefulAction{
+		Type:            dv1.GracefulActionScaleDown,
+		Phase:           dv1.GracefulPhaseTriggerDrain,
+		DesiredReplicas: &storedDesiredReplicas,
+	})
+	if err := dcgs.K8sclient.Update(context.Background(), existing.DeepCopy()); err != nil {
+		t.Fatalf("update existing StatefulSet: %v", err)
+	}
+
+	skipApply, err := dcgs.gracefulRolloutReconcile(context.Background(), &rest.Config{}, desired, existing, cluster, cg, cgStatus)
+	if err != nil {
+		t.Fatalf("gracefulRolloutReconcile failed: %v", err)
+	}
+	if skipApply {
+		t.Fatal("expected untouched scale-down action to be cancelled")
+	}
+	if cgStatus.Phase != dv1.Reconciling {
+		t.Fatalf("expected phase %s, got %s", dv1.Reconciling, cgStatus.Phase)
+	}
+
+	live := &appv1.StatefulSet{}
+	if err := dcgs.K8sclient.Get(context.Background(), client.ObjectKeyFromObject(existing), live); err != nil {
+		t.Fatalf("get live StatefulSet: %v", err)
+	}
+	if hasGracefulAction(live) {
+		t.Fatalf("expected graceful action annotation to be cleared, got %q", gracefulAnnotationValue(live))
+	}
+}
+
+func TestUpdateStatefulSetReplicasUpdatesLiveAndCachedState(t *testing.T) {
+	dcgs, _, _, _, _, existing := newGracefulScaleDownTestObjects(t)
+
+	if err := dcgs.updateStatefulSetReplicas(context.Background(), existing, 1); err != nil {
+		t.Fatalf("updateStatefulSetReplicas failed: %v", err)
+	}
+	if got := *existing.Spec.Replicas; got != 1 {
+		t.Fatalf("expected cached StatefulSet replicas 1, got %d", got)
+	}
+
+	live := &appv1.StatefulSet{}
+	if err := dcgs.K8sclient.Get(context.Background(), client.ObjectKeyFromObject(existing), live); err != nil {
+		t.Fatalf("get live StatefulSet: %v", err)
+	}
+	if got := *live.Spec.Replicas; got != 1 {
+		t.Fatalf("expected live StatefulSet replicas 1, got %d", got)
+	}
+}
+
+func TestGetOperationTypeDoesNotRetryScaleDownAfterScaleUp(t *testing.T) {
+	desired := newGracefulTestStatefulSet("default", "doris-cg1", 3)
+	existing := newGracefulTestStatefulSet("default", "doris-cg1", 3)
+	if got := getOperationType(desired, existing, dv1.ScaleDownFailed); got != "" {
+		t.Fatalf("expected no scale-down when desired equals existing, got %q", got)
+	}
+
+	*desired.Spec.Replicas = 2
+	if got := getOperationType(desired, existing, dv1.ScaleDownFailed); got != "scaleDown" {
+		t.Fatalf("expected replica difference to trigger scale-down, got %q", got)
+	}
+}
+
 func TestFinalizeGracefulAction_KeepsOnDeleteStrategy(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := appv1.AddToScheme(scheme); err != nil {

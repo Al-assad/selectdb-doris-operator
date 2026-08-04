@@ -108,10 +108,10 @@ func (dcgs *DisaggregatedComputeGroupsController) scaledOutBENodesByDecommission
 	return nil
 }
 
-func getOperationType(st, est *appv1.StatefulSet, phase dv1.Phase) string {
+func getOperationType(st, est *appv1.StatefulSet, _ dv1.Phase) string {
 	//Should not check 'phase == dv1.Ready', because the default value of the state initialization is Reconciling in the new Reconcile
 	// *st.Spec.Replicas < *est.Spec.Replicas represents need initial scaleDown, it belongs to the start phase.
-	if *(st.Spec.Replicas) < *(est.Spec.Replicas) || phase == dv1.Decommissioning || phase == dv1.ScaleDownFailed {
+	if *(st.Spec.Replicas) < *(est.Spec.Replicas) {
 		return "scaleDown"
 	}
 	return ""

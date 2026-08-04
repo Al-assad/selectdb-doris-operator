@@ -34,9 +34,9 @@ func Test_ShowFrontends(t *testing.T) {
 	}
 
 	columns := []string{"Name", "Host", "EditLogPort", "HttpPort", "QueryPort", "RpcPort", "ArrowFlightSqlPort", "Role", "IsMaster",
-		"ClusterId", "Join", "Alive", "ReplayedJournalId", "LastStartTime", "LastHeartbeat", "IsHelper", "ErrMsg", "Version", "CurrentConnected"}
+		"ClusterId", "Join", "Alive", "ReplayedJournalId", "LastStartTime", "LastHeartbeat", "IsHelper", "ErrMsg", "Version", "CurrentConnected", "LiveSince", "FutureUnknownColumn"}
 	values := []driver.Value{"fe_36d7bccc_d358_4dfd_ad4c_6e988f94f12d", "doriscluster-sample-fe-0.doriscluster-sample-fe-internal.default.svc.cluster.local", 9010, 8030, 9030, 9020, -1, "FOLLOWER", true, "1807668748", true, true, "15443", "2024-08-21 10:04:29",
-		"2024-08-22 07:29:55", true, "", "doris-2.1.5-rc02-d5a02e095d", "Yes"}
+		"2024-08-22 07:29:55", true, "", "doris-2.1.5-rc02-d5a02e095d", "Yes", "2024-08-21 10:04:29", "ignored"}
 	mock.ExpectQuery("show frontends").WillReturnRows(sqlmock.NewRows(columns).AddRows(values))
 	dorisdb := sqlx.NewDb(mysql_db, "mysql")
 	db := &DB{
@@ -48,18 +48,21 @@ func Test_ShowFrontends(t *testing.T) {
 		t.Errorf("show frontends failed, %s", err.Error())
 	}
 	if len(fts) != 1 {
-		t.Errorf("show frontends failed, not retun one frontend.")
+		t.Fatalf("show frontends failed, expected one frontend, got %d", len(fts))
+	}
+	if fts[0].Host != "doriscluster-sample-fe-0.doriscluster-sample-fe-internal.default.svc.cluster.local" || fts[0].Role != "FOLLOWER" {
+		t.Errorf("show frontends failed, known fields were not mapped: %+v", fts[0])
 	}
 }
 
 func Test_ShowBackends(t *testing.T) {
 	columns := []string{"BackendId", "Host", "HeartbeatPort", "BePort", "HttpPort", "BrpcPort", "ArrowFlightSqlPort", "LastStartTime",
 		"LastHeartbeat", "Alive", "SystemDecommissioned", "TabletNum", "DataUsedCapacity", "TrashUsedCapacity", "AvailCapacity", "TotalCapacity", "UsedPct", "MaxDiskUsedPct",
-		"RemoteUsedCapacity", "Tag", "ErrMsg", "Version", "Status", "HeartbeatFailureCounter", "NodeRole"}
+		"RemoteUsedCapacity", "Tag", "ErrMsg", "Version", "Status", "HeartbeatFailureCounter", "NodeRole", "LiveSince", "FutureUnknownColumn"}
 	values := []driver.Value{"10009", "doriscluster-sample-be-0.doriscluster-sample-be-internal.default.svc.cluster.local", 9050, 9060, 8040, 8060, -1, "2024-08-21 10:05:37",
 		"2024-08-22 08:29:46", true, false, 24, "0.000", "0.000", "74.619 GB", "439.037 GB", "83.00 %", "83.00 %", "0.000",
 		"{\"location\" : \"default\"}", "", "doris-2.1.5-rc02-d5a02e095d", "{\"lastSuccessReportTabletsTime\":\"2024-08-22 08:29:09\",\"lastStreamLoadTime\":-1,\"isQueryDisabled\":false,\"isLoadDisabled\":false}",
-		0, "mix"}
+		0, "mix", "2024-08-21 10:05:37", "ignored"}
 	mysql_db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Errorf("sqlmock new failed %s", err.Error())
@@ -76,7 +79,10 @@ func Test_ShowBackends(t *testing.T) {
 		t.Errorf("show backends failed, %s", err.Error())
 	}
 	if len(bds) != 1 {
-		t.Errorf("show backends failed, not return one backend.")
+		t.Fatalf("show backends failed, expected one backend, got %d", len(bds))
+	}
+	if bds[0].BackendID != "10009" || bds[0].NodeRole != "mix" {
+		t.Errorf("show backends failed, known fields were not mapped: %+v", bds[0])
 	}
 }
 

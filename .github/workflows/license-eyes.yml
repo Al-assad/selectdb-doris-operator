@@ -17,21 +17,15 @@
 #
 ---
 name: License Check
-on: [push, pull_request_target]
+on: [push, pull_request]
 
 jobs:
   license-check:
     name: "License Check"
     runs-on: ubuntu-latest
     steps:
-      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        if: ${{ github.event_name != 'pull_request_target' }}
-        uses: actions/checkout@v3
-      - name: Checkout ${{ github.ref }} ( ${{ github.event.pull_request.head.sha }} )
-        if: ${{ github.event_name == 'pull_request_target' }}
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Check License
         uses: apache/skywalking-eyes@v0.2.0
         env:

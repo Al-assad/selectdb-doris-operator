@@ -20,6 +20,7 @@ package mysql
 import (
 	_ "crypto/tls"
 	"database/sql/driver"
+	"regexp"
 	"strconv"
 	"testing"
 
@@ -149,11 +150,10 @@ func Test_DecommissionBE(t *testing.T) {
 }
 
 func Test_DropObserver(t *testing.T) {
-	version := "doris-2.1.5-rc02-d5a02e095d"
-	startTime := "2024-08-21 10:04:29"
-	heartbeat := "2024-08-22 07:29:55"
-	values := []*Frontend{{"fe_36d7bccc_d358_4dfd_ad4c_6e988f94f12d", "doriscluster-sample-fe-0.doriscluster-sample-fe-internal.default.svc.cluster.local", 9010, 8030, 9030, 9020, -1, "FOLLOWER", true, "1807668748", true, true, "15443", &startTime,
-		&heartbeat, true, "", &version, "Yes"}}
+	values := []*Frontend{
+		{Host: "doriscluster-sample-fe-4.doriscluster-sample-fe-internal.default.svc.cluster.local", EditLogPort: 9010},
+		{Host: "doriscluster-sample-fe-3.doriscluster-sample-fe-internal.default.svc.cluster.local", EditLogPort: 9010},
+	}
 
 	tests := [][]*Frontend{
 		{},
@@ -164,7 +164,10 @@ func Test_DropObserver(t *testing.T) {
 	if err != nil {
 		t.Errorf("sqlmock new failed %s", err.Error())
 	}
-	mock.ExpectExec("ALTER SYSTEM DROP OBSERVER").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("ALTER SYSTEM DROP OBSERVER \"doriscluster-sample-fe-4.doriscluster-sample-fe-internal.default.svc.cluster.local:9010\";")).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("ALTER SYSTEM DROP OBSERVER \"doriscluster-sample-fe-3.doriscluster-sample-fe-internal.default.svc.cluster.local:9010\";")).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	dorisdb := sqlx.NewDb(mysql_db, "mysql")
 	db := &DB{
 		DB: dorisdb,
@@ -178,6 +181,9 @@ func Test_DropObserver(t *testing.T) {
 				t.Errorf("test decommission failed, err=%s", err.Error())
 			}
 		})
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("drop observer expectations were not met: %s", err)
 	}
 }
 

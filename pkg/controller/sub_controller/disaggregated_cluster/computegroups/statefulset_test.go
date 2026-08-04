@@ -19,14 +19,17 @@ package computegroups
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	dv1 "github.com/apache/doris-operator/api/disaggregated/v1"
 	"github.com/apache/doris-operator/pkg/common/utils/mysql"
 	"github.com/apache/doris-operator/pkg/common/utils/resource"
+	"github.com/jmoiron/sqlx"
 	appv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +40,62 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestDropBackendEnsuringAbsent(t *testing.T) {
+	tests := []struct {
+		name        string
+		showRows    *sqlmock.Rows
+		showErr     error
+		wantErrText string
+	}{
+		{
+			name:     "drop error but backend is absent",
+			showRows: sqlmock.NewRows([]string{"Host", "HeartbeatPort"}),
+		},
+		{
+			name: "drop error and backend is still present",
+			showRows: sqlmock.NewRows([]string{"Host", "HeartbeatPort"}).
+				AddRow("test-be-2.test-be-internal.default.svc.cluster.local", 9050),
+			wantErrText: "backend is still present",
+		},
+		{
+			name:        "drop error and verification fails",
+			showErr:     errors.New("show backends failed"),
+			wantErrText: "verify backend state failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mysqlDB, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock new failed: %v", err)
+			}
+			db := &mysql.DB{DB: sqlx.NewDb(mysqlDB, "mysql")}
+			defer db.Close()
+
+			target := &mysql.Backend{Host: "test-be-2.test-be-internal.default.svc.cluster.local", HeartbeatPort: 9050}
+			mock.ExpectExec("ALTER SYSTEM DROPP BACKEND").WillReturnError(errors.New("drop failed"))
+			showExpectation := mock.ExpectQuery("show backends")
+			if tt.showErr != nil {
+				showExpectation.WillReturnError(tt.showErr)
+			} else {
+				showExpectation.WillReturnRows(tt.showRows)
+			}
+
+			err = dropBackendEnsuringAbsent(db, target)
+			if tt.wantErrText == "" && err != nil {
+				t.Fatalf("expected success, got: %v", err)
+			}
+			if tt.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrText)) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErrText, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sql expectations: %v", err)
+			}
+		})
+	}
+}
 
 func Test_NewPodTemplateSpec_TerminationGracePeriodSeconds(t *testing.T) {
 	ddc := &dv1.DorisDisaggregatedCluster{

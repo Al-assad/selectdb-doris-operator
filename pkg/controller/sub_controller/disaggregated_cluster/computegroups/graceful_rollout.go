@@ -841,7 +841,7 @@ func (dcgs *DisaggregatedComputeGroupsController) dropBackendByPodName(
 	}
 	for _, backend := range backends {
 		if backendMatchesPod(backend, podName) {
-			return sqlClient.DropBE([]*mysql.Backend{backend})
+			return dropBackendEnsuringAbsent(sqlClient, backend)
 		}
 	}
 	klog.Infof("dropBackendByPodName: backend for pod %s is already absent", podName)

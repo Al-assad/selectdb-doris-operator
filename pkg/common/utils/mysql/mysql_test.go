@@ -270,25 +270,6 @@ func Test_DropBE(t *testing.T) {
 	}
 }
 
-func TestDropBEIgnoresAlreadyAbsentBackend(t *testing.T) {
-	mysqlDB, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock new failed: %v", err)
-	}
-	db := &DB{DB: sqlx.NewDb(mysqlDB, "mysql")}
-	defer db.Close()
-
-	query := regexp.QuoteMeta(`ALTER SYSTEM DROPP BACKEND "test:9050";`)
-	mock.ExpectExec(query).WillReturnError(errors.New("errCode = 2, detailMessage = [CLUSTER_NOT_FOUND] can not find to drop nodes by cloud_unique_id=1:2:test"))
-
-	if err := db.DropBE([]*Backend{{Host: "test", HeartbeatPort: 9050}}); err != nil {
-		t.Fatalf("expected already absent backend to be ignored, got: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet sql expectations: %v", err)
-	}
-}
-
 func TestDropBEReturnsUnexpectedError(t *testing.T) {
 	mysqlDB, mock, err := sqlmock.New()
 	if err != nil {

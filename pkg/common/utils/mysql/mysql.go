@@ -186,14 +186,14 @@ func (db *DB) DropBE(nodes []*Backend) error {
 		klog.Infoln("mysql DropBE BE node is empty")
 		return nil
 	}
-	nodesString := fmt.Sprintf(`"%s:%d"`, nodes[0].Host, nodes[0].HeartbeatPort)
-	for _, node := range nodes[1:] {
-		nodesString = nodesString + fmt.Sprintf(`,"%s:%d"`, node.Host, node.HeartbeatPort)
-	}
 
-	alter := fmt.Sprintf("ALTER SYSTEM DROPP BACKEND %s;", nodesString)
-	_, err := db.Exec(alter)
-	return err
+	for _, node := range nodes {
+		alter := fmt.Sprintf(`ALTER SYSTEM DROPP BACKEND "%s:%d";`, node.Host, node.HeartbeatPort)
+		if _, err := db.Exec(alter); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *DB) DropObserver(nodes []*Frontend) error {
@@ -201,12 +201,13 @@ func (db *DB) DropObserver(nodes []*Frontend) error {
 		klog.Infoln("DropObserver observer node is empty")
 		return nil
 	}
-	var alter string
 	for _, node := range nodes {
-		alter = alter + fmt.Sprintf(`ALTER SYSTEM DROP OBSERVER "%s:%d";`, node.Host, node.EditLogPort)
+		alter := fmt.Sprintf(`ALTER SYSTEM DROP OBSERVER "%s:%d";`, node.Host, node.EditLogPort)
+		if _, err := db.Exec(alter); err != nil {
+			return fmt.Errorf("drop observer %s:%d failed: %w", node.Host, node.EditLogPort, err)
+		}
 	}
-	_, err := db.Exec(alter)
-	return err
+	return nil
 }
 
 func (db *DB) GetObservers() ([]*Frontend, error) {

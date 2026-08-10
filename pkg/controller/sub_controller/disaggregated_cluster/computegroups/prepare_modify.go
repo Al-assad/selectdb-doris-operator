@@ -19,6 +19,8 @@ package computegroups
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -108,10 +110,10 @@ func (dcgs *DisaggregatedComputeGroupsController) scaledOutBENodesByDecommission
 	return nil
 }
 
-func getOperationType(st, est *appv1.StatefulSet, phase dv1.Phase) string {
+func getOperationType(st, est *appv1.StatefulSet, _ dv1.Phase) string {
 	//Should not check 'phase == dv1.Ready', because the default value of the state initialization is Reconciling in the new Reconcile
 	// *st.Spec.Replicas < *est.Spec.Replicas represents need initial scaleDown, it belongs to the start phase.
-	if *(st.Spec.Replicas) < *(est.Spec.Replicas) || phase == dv1.Decommissioning || phase == dv1.ScaleDownFailed {
+	if *(st.Spec.Replicas) < *(est.Spec.Replicas) {
 		return "scaleDown"
 	}
 	return ""
@@ -131,11 +133,38 @@ func (dcgs *DisaggregatedComputeGroupsController) scaledOutBENodesByDrop(
 	if len(dropNodes) == 0 {
 		return nil
 	}
-	err = masterDBClient.DropBE(dropNodes)
-	if err != nil {
-		klog.Errorf("scaledOutBENodesByDrop cgid %s DropBENodes failed, err:%s ", cgid, err.Error())
-		return err
+	for _, node := range dropNodes {
+		if err := dropBackendEnsuringAbsent(masterDBClient, node); err != nil {
+			klog.Errorf("scaledOutBENodesByDrop cgid %s DropBENode failed, err:%s ", cgid, err.Error())
+			return err
+		}
 	}
+	return nil
+}
+
+func dropBackendEnsuringAbsent(sqlClient *mysql.DB, target *mysql.Backend) error {
+	if target == nil {
+		return errors.New("drop backend target is nil")
+	}
+
+	dropErr := sqlClient.DropBE([]*mysql.Backend{target})
+	if dropErr == nil {
+		return nil
+	}
+
+	backends, verifyErr := sqlClient.ShowBackends()
+	if verifyErr != nil {
+		return fmt.Errorf("drop backend %s:%d failed: %w; verify backend state failed: %v",
+			target.Host, target.HeartbeatPort, dropErr, verifyErr)
+	}
+	for _, backend := range backends {
+		if backend.Host == target.Host && backend.HeartbeatPort == target.HeartbeatPort {
+			return fmt.Errorf("drop backend %s:%d failed and backend is still present: %w",
+				target.Host, target.HeartbeatPort, dropErr)
+		}
+	}
+
+	klog.Infof("drop backend %s:%d returned an error but the backend is already absent", target.Host, target.HeartbeatPort)
 	return nil
 }
 

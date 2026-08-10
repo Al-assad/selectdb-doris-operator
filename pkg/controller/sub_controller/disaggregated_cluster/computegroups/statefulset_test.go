@@ -19,14 +19,17 @@ package computegroups
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	dv1 "github.com/apache/doris-operator/api/disaggregated/v1"
 	"github.com/apache/doris-operator/pkg/common/utils/mysql"
 	"github.com/apache/doris-operator/pkg/common/utils/resource"
+	"github.com/jmoiron/sqlx"
 	appv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +40,62 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestDropBackendEnsuringAbsent(t *testing.T) {
+	tests := []struct {
+		name        string
+		showRows    *sqlmock.Rows
+		showErr     error
+		wantErrText string
+	}{
+		{
+			name:     "drop error but backend is absent",
+			showRows: sqlmock.NewRows([]string{"Host", "HeartbeatPort"}),
+		},
+		{
+			name: "drop error and backend is still present",
+			showRows: sqlmock.NewRows([]string{"Host", "HeartbeatPort"}).
+				AddRow("test-be-2.test-be-internal.default.svc.cluster.local", 9050),
+			wantErrText: "backend is still present",
+		},
+		{
+			name:        "drop error and verification fails",
+			showErr:     errors.New("show backends failed"),
+			wantErrText: "verify backend state failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mysqlDB, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock new failed: %v", err)
+			}
+			db := &mysql.DB{DB: sqlx.NewDb(mysqlDB, "mysql")}
+			defer db.Close()
+
+			target := &mysql.Backend{Host: "test-be-2.test-be-internal.default.svc.cluster.local", HeartbeatPort: 9050}
+			mock.ExpectExec("ALTER SYSTEM DROPP BACKEND").WillReturnError(errors.New("drop failed"))
+			showExpectation := mock.ExpectQuery("show backends")
+			if tt.showErr != nil {
+				showExpectation.WillReturnError(tt.showErr)
+			} else {
+				showExpectation.WillReturnRows(tt.showRows)
+			}
+
+			err = dropBackendEnsuringAbsent(db, target)
+			if tt.wantErrText == "" && err != nil {
+				t.Fatalf("expected success, got: %v", err)
+			}
+			if tt.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrText)) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErrText, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sql expectations: %v", err)
+			}
+		})
+	}
+}
 
 func Test_NewPodTemplateSpec_TerminationGracePeriodSeconds(t *testing.T) {
 	ddc := &dv1.DorisDisaggregatedCluster{
@@ -333,6 +392,72 @@ func TestGracefulRolloutReconcile_EnablesGracefulActionWhenSentinelSupported(t *
 	}
 	if cgStatus.Phase != dv1.GracefulScaling {
 		t.Fatalf("expected compute group phase %s, got %s", dv1.GracefulScaling, cgStatus.Phase)
+	}
+}
+
+func TestGracefulRolloutReconcileCancelsUntouchedScaleDownAfterScaleUp(t *testing.T) {
+	dcgs, cluster, cg, cgStatus, desired, existing := newGracefulScaleDownTestObjects(t)
+	requestedReplicas := int32(2)
+	desired.Spec.Replicas = &requestedReplicas
+	storedDesiredReplicas := int32(1)
+	setGracefulAction(existing, &dv1.GracefulAction{
+		Type:            dv1.GracefulActionScaleDown,
+		Phase:           dv1.GracefulPhaseTriggerDrain,
+		DesiredReplicas: &storedDesiredReplicas,
+	})
+	if err := dcgs.K8sclient.Update(context.Background(), existing.DeepCopy()); err != nil {
+		t.Fatalf("update existing StatefulSet: %v", err)
+	}
+
+	skipApply, err := dcgs.gracefulRolloutReconcile(context.Background(), &rest.Config{}, desired, existing, cluster, cg, cgStatus)
+	if err != nil {
+		t.Fatalf("gracefulRolloutReconcile failed: %v", err)
+	}
+	if skipApply {
+		t.Fatal("expected untouched scale-down action to be cancelled")
+	}
+	if cgStatus.Phase != dv1.Reconciling {
+		t.Fatalf("expected phase %s, got %s", dv1.Reconciling, cgStatus.Phase)
+	}
+
+	live := &appv1.StatefulSet{}
+	if err := dcgs.K8sclient.Get(context.Background(), client.ObjectKeyFromObject(existing), live); err != nil {
+		t.Fatalf("get live StatefulSet: %v", err)
+	}
+	if hasGracefulAction(live) {
+		t.Fatalf("expected graceful action annotation to be cleared, got %q", gracefulAnnotationValue(live))
+	}
+}
+
+func TestUpdateStatefulSetReplicasUpdatesLiveAndCachedState(t *testing.T) {
+	dcgs, _, _, _, _, existing := newGracefulScaleDownTestObjects(t)
+
+	if err := dcgs.updateStatefulSetReplicas(context.Background(), existing, 1); err != nil {
+		t.Fatalf("updateStatefulSetReplicas failed: %v", err)
+	}
+	if got := *existing.Spec.Replicas; got != 1 {
+		t.Fatalf("expected cached StatefulSet replicas 1, got %d", got)
+	}
+
+	live := &appv1.StatefulSet{}
+	if err := dcgs.K8sclient.Get(context.Background(), client.ObjectKeyFromObject(existing), live); err != nil {
+		t.Fatalf("get live StatefulSet: %v", err)
+	}
+	if got := *live.Spec.Replicas; got != 1 {
+		t.Fatalf("expected live StatefulSet replicas 1, got %d", got)
+	}
+}
+
+func TestGetOperationTypeDoesNotRetryScaleDownAfterScaleUp(t *testing.T) {
+	desired := newGracefulTestStatefulSet("default", "doris-cg1", 3)
+	existing := newGracefulTestStatefulSet("default", "doris-cg1", 3)
+	if got := getOperationType(desired, existing, dv1.ScaleDownFailed); got != "" {
+		t.Fatalf("expected no scale-down when desired equals existing, got %q", got)
+	}
+
+	*desired.Spec.Replicas = 2
+	if got := getOperationType(desired, existing, dv1.ScaleDownFailed); got != "scaleDown" {
+		t.Fatalf("expected replica difference to trigger scale-down, got %q", got)
 	}
 }
 

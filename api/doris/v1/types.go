@@ -43,6 +43,10 @@ var (
 	AnnotationDebugValue = "debug"
 )
 
+// AnnotationReconcilePaused pauses reconciliation for a DorisCluster while
+// still allowing deletion cleanup to proceed.
+const AnnotationReconcilePaused = "selectdb.com.doris/reconcile-paused"
+
 // DorisClusterSpec defines the desired state of DorisCluster
 type DorisClusterSpec struct {
 	//defines the fe cluster state that will be created by operator.

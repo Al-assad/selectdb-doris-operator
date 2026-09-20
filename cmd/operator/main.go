@@ -118,7 +118,7 @@ func main() {
 		HealthProbeBindAddress: f.ProbeAddr,
 		Namespace:              f.Namespace,
 		LeaderElection:         f.EnableLeaderElection,
-		LeaderElectionID:       "e1370669.selectdb.com",
+		LeaderElectionID:       f.LeaderElectionID,
 		//if one reconcile failed, others will not be affected.
 		Controller: v1alpha1.ControllerConfigurationSpec{
 			RecoverPanic: pointer.Bool(true),

@@ -583,6 +583,7 @@ spec:
             - /dorisoperator
           args:
             - --leader-elect
+            - --leader-election-id=e1370669.selectdb.com
           image: selectdb/doris.k8s-operator:latest
           imagePullPolicy: Always
           name: dorisoperator

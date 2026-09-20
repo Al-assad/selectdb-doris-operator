@@ -131,6 +131,11 @@ func (r *DorisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	if dcr.Annotations[dorisv1.AnnotationReconcilePaused] == "true" {
+		klog.Infof("DorisClusterReconciler skip paused DorisCluster namespace=%s name=%s", dcr.Namespace, dcr.Name)
+		return ctrl.Result{}, nil
+	}
+
 	//subControllers reconcile for create or update sub resource.
 	for _, rc := range r.Scs {
 		if err := rc.Sync(ctx, dcr); err != nil {

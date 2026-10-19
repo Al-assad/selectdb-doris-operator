@@ -706,6 +706,13 @@ func (dcgs *DisaggregatedComputeGroupsController) ClearStatefulsetUnusedPVCs(ctx
 			continue
 		}
 		if int32(index) >= replicas {
+			retain, err := runtimeconfig.RetainPVCOnScaleDown(sts, pvcName)
+			if err != nil {
+				return err
+			}
+			if retain {
+				continue
+			}
 			clearPVC = append(clearPVC, pvcName)
 		}
 	}
